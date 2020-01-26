@@ -2,6 +2,7 @@ from .approximation import Approximation
 from .q_continuous import QContinuous
 from .q_dist import QDist
 from .q_network import QNetwork
+from .quantile_network import QuantileNetwork
 from .v_network import VNetwork
 from .feature_network import FeatureNetwork
 from .target import TargetNetwork, FixedTarget, PolyakTarget, TrivialTarget
@@ -13,6 +14,7 @@ __all__ = [
     "QContinuous",
     "QDist",
     "QNetwork",
+    "QuantileNetwork",
     "VNetwork",
     "FeatureNetwork",
     "TargetNetwork",

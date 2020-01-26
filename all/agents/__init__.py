@@ -4,6 +4,7 @@ from .c51 import C51
 from .ddpg import DDPG
 from .ddqn import DDQN
 from .dqn import DQN
+from .fqf import FQF
 from .ppo import PPO
 from .rainbow import Rainbow
 from .sac import SAC
@@ -19,6 +20,7 @@ __all__ = [
     "DDPG",
     "DDQN",
     "DQN",
+    "FQF",
     "PPO",
     "Rainbow",
     "SAC",

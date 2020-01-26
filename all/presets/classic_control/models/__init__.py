@@ -37,7 +37,7 @@ def fc_value_head(hidden=64):
 
 
 def fc_policy_head(env, hidden=64):
-    return nn.Linear0(hidden, env.action_space.n)
+    return nn.Linear(hidden, env.action_space.n)
 
 
 def fc_relu_dist_q(env, hidden=64, atoms=51):

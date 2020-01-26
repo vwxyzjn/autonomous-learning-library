@@ -1,5 +1,5 @@
-import torch
 import numpy as np
+import torch
 from all.logging import DummyWriter
 from ._agent import Agent
 
@@ -7,12 +7,12 @@ from ._agent import Agent
 class FQF(Agent):
     """
     Fully Parameterized Quantile Function (FQF).
+    Starting with IQN.
 
     Args:
         q_dist (QDist): Approximation of the Q distribution.
         replay_buffer (ReplayBuffer): The experience replay buffer.
         discount_factor (float): Discount factor for future rewards.
-        eps (float): Stability parameter for computing the loss function.
         exploration (float): The probability of choosing a random action.
         minibatch_size (int): The number of experiences to sample in each training update.
         replay_start_size (int): Number of experiences in replay buffer when training begins.
@@ -21,33 +21,40 @@ class FQF(Agent):
 
     def __init__(
             self,
-            fraction_proposer,
+            f,
             quantile_network,
             replay_buffer,
             discount_factor=0.99,
-            eps=1e-5,
             exploration=0.02,
+            huber_loss_threshold=1,
             minibatch_size=32,
+            num_tau_samples=32,
             replay_start_size=5000,
             update_frequency=1,
             writer=DummyWriter(),
     ):
         # objects
-        self.fraction_proposer = fraction_proposer
+        self.f = f
         self.quantile_network = quantile_network
         self.replay_buffer = replay_buffer
         self.writer = writer
         # hyperparameters
-        self.eps = eps
         self.exploration = exploration
         self.replay_start_size = replay_start_size
         self.update_frequency = update_frequency
         self.minibatch_size = minibatch_size
         self.discount_factor = discount_factor
+        self.huber_loss_threshold = huber_loss_threshold
+        self.num_tau_samples = num_tau_samples
         # private
         self._state = None
         self._action = None
         self._frames_seen = 0
+        self._quantiles_act = (
+            torch.linspace(0, 1, num_tau_samples).view((1, num_tau_samples)).to(self.quantile_network.device))
+        self._quantiles_train = (torch.linspace(0, 1, num_tau_samples)
+                                 .expand((minibatch_size, num_tau_samples))
+                                 .to(self.quantile_network.device))
 
     def act(self, state, reward):
         self.replay_buffer.store(self._state, self._action, reward, state)
@@ -64,17 +71,15 @@ class FQF(Agent):
         return self._best_action(state)
 
     def _should_explore(self):
-        return (
-            len(self.replay_buffer) < self.replay_start_size
-            or np.random.rand() < self.exploration
-        )
+        return (np.random.rand() < self.exploration)
+        # return (
+        #     len(self.replay_buffer) < self.replay_start_size
+        #     or np.random.rand() < self.exploration
+        # )
 
     def _best_action(self, state):
-        proposed_fractions = self.fraction_proposer.eval(state)
-        quantile_sizes = proposed_fractions[:, :, 1:] - proposed_fractions[:, 0:-1]
-        quantile_centers = (proposed_fractions[:, :, 1:] + proposed_fractions[:, :, 0:-1]) / 2
-        quantile_means = self.quantile_network.eval(quantile_centers, state)
-        q = torch.sum(quantile_sizes * quantile_means, dim=2)
+        quantile_values = self.quantile_network.eval(self._quantiles_act, self.f.eval(state))
+        q = torch.mean(quantile_values, dim=-1)
         return torch.argmax(q, dim=1)
 
     def _train(self):
@@ -82,35 +87,31 @@ class FQF(Agent):
             # sample transitions from buffer
             states, actions, rewards, next_states, _ = self.replay_buffer.sample(self.minibatch_size)
             # forward pass
-            proposed_fractions = self.fraction_proposer(states, actions)
-            quantile_centers = (proposed_fractions[:, 1:] + proposed_fractions[:, 0:-1]) / 2
-            quantile_means = self.quantile_network(quantile_centers, states, actions)
+            self._quantiles_train = torch.randn((self.minibatch_size, self.num_tau_samples), device=self.quantile_network.device)
+            quantile_values = self.quantile_network(self._quantiles_train, self.f(states), actions)
             # compute targets
-            next_proposed_fractions = self.fraction_proposer.target(next_states)
-            next_quantile_sizes = next_proposed_fractions[:, :, 1:] - next_proposed_fractions[:, 0:-1]
-            next_quantile_centers = (next_proposed_fractions[:, :, 1:] + next_proposed_fractions[:, :, 0:-1]) / 2
-            next_quantile_means = self.quantile_network.target(next_quantile_centers, next_states)
-            q = torch.sum(next_quantile_sizes * next_quantile_means, dim=2)
-            next_actions = torch.argmax(q, dim=1)
-            target_quantile_means = next_quantile_means[torch.arange(self.minibatch_size), next_actions]
+            next_quantile_values = self.quantile_network.target(self._quantiles_train, self.f.target(next_states))
+            next_q = torch.mean(next_quantile_values, dim=-1)
+            next_actions = torch.argmax(next_q, dim=1)
+            next_quantile_values = next_quantile_values[torch.arange(self.minibatch_size), next_actions]
+            target_quantile_values = rewards[:, None] + self.discount_factor * next_quantile_values
             # compute loss
-            quantile_td_error = rewards + self.discount_factor * target_quantile_means - quantile_means
-            loss = self._huber_quantile_regression_loss(proposed_fractions, quantile_td_error)
-            # compute dw/dtau
-            # TODO
-            dwdt = None
+            quantile_td_error = target_quantile_values[:, :, None] - quantile_values[:, None, :]
+            loss = self._huber_quantile_regression_loss(quantile_td_error).mean()
             # backward pass
-            proposed_fractions.backward(dwdt)
-            self.fraction_proposer.step()
             self.quantile_network.reinforce(loss)
+            self.f.reinforce()
+            # debugging
+            self.writer.add_loss('q_mean', quantile_values.detach().mean())
 
     def _should_train(self):
         self._frames_seen += 1
         return self._frames_seen > self.replay_start_size and self._frames_seen % self.update_frequency == 0
 
-    def _huber_quantile_regression_loss(self, proposed_fractions, quantile_td_error):
-        kappa = 1
-        huber_loss_case_one = (quantile_td_error <= kappa).float() * 0.5 * quantile_td_error ** 2
-        huber_loss_case_two = (quantile_td_error > kappa).float() * kappa * (quantile_td_error.abs() - 0.5 * kappa)
+    def _huber_quantile_regression_loss(self, quantile_td_error):
+        k = self.huber_loss_threshold
+        abs_quantile_td_error = torch.abs(quantile_td_error)
+        huber_loss_case_one = (abs_quantile_td_error <= k).float() * 0.5 * quantile_td_error ** 2
+        huber_loss_case_two = (abs_quantile_td_error > k).float() * k * (abs_quantile_td_error - 0.5 * k)
         huber_loss = huber_loss_case_one + huber_loss_case_two
-        return torch.abs(proposed_fractions - (quantile_td_error < 0).float()) * huber_loss / kappa
+        return (torch.abs(self._quantiles_train[:, :, None] - (quantile_td_error < 0).float()) * huber_loss) / k
