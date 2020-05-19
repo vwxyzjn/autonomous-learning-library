@@ -28,7 +28,7 @@ def run_experiment(
                 write_loss=write_loss
             )
             experiment.train(frames=frames)
-            experiment.test(episodes=test_episodes)
+            # experiment.test(episodes=test_episodes)
 
 
 def get_experiment_type(agent):
